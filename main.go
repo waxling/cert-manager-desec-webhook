@@ -1,15 +1,23 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/cert-manager/cert-manager/pkg/acme/webhook/cmd"
+	v1 "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
+	"github.com/cert-manager/cert-manager/pkg/issuer/acme/dns/util"
+	"github.com/nrdcg/desec"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/klog/v2"
 	"os"
+	"strings"
 
 	extapi "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
 
 	"github.com/cert-manager/cert-manager/pkg/acme/webhook/apis/acme/v1alpha1"
-	"github.com/cert-manager/cert-manager/pkg/acme/webhook/cmd"
 )
 
 var GroupName = os.Getenv("GROUP_NAME")
@@ -18,122 +26,90 @@ func main() {
 	if GroupName == "" {
 		panic("GROUP_NAME must be specified")
 	}
-
-	// This will register our custom DNS provider with the webhook serving
-	// library, making it available as an API under the provided GroupName.
-	// You can register multiple DNS provider implementations with a single
-	// webhook, where the Name() method will be used to disambiguate between
-	// the different implementations.
 	cmd.RunWebhookServer(GroupName,
-		&customDNSProviderSolver{},
+		&desecDNSProviderSolver{},
 	)
 }
 
-// customDNSProviderSolver implements the provider-specific logic needed to
-// 'present' an ACME challenge TXT record for your own DNS provider.
-// To do so, it must implement the `github.com/cert-manager/cert-manager/pkg/acme/webhook.Solver`
-// interface.
-type customDNSProviderSolver struct {
-	// If a Kubernetes 'clientset' is needed, you must:
-	// 1. uncomment the additional `client` field in this structure below
-	// 2. uncomment the "k8s.io/client-go/kubernetes" import at the top of the file
-	// 3. uncomment the relevant code in the Initialize method below
-	// 4. ensure your webhook's service account has the required RBAC role
-	//    assigned to it for interacting with the Kubernetes APIs you need.
-	//client kubernetes.Clientset
+type desecDNSProviderSolver struct {
+	client *kubernetes.Clientset
 }
 
-// customDNSProviderConfig is a structure that is used to decode into when
-// solving a DNS01 challenge.
-// This information is provided by cert-manager, and may be a reference to
-// additional configuration that's needed to solve the challenge for this
-// particular certificate or issuer.
-// This typically includes references to Secret resources containing DNS
-// provider credentials, in cases where a 'multi-tenant' DNS solver is being
-// created.
-// If you do *not* require per-issuer or per-certificate configuration to be
-// provided to your webhook, you can skip decoding altogether in favour of
-// using CLI flags or similar to provide configuration.
-// You should not include sensitive information here. If credentials need to
-// be used by your provider here, you should reference a Kubernetes Secret
-// resource and fetch these credentials using a Kubernetes clientset.
-type customDNSProviderConfig struct {
-	// Change the two fields below according to the format of the configuration
-	// to be decoded.
-	// These fields will be set by users in the
-	// `issuer.spec.acme.dns01.providers.webhook.config` field.
-
-	//Email           string `json:"email"`
-	//APIKeySecretRef v1alpha1.SecretKeySelector `json:"apiKeySecretRef"`
+type desecDNSProviderConfig struct {
+	APIKeySecretRef v1.SecretKeySelector `json:"apiKeySecretRef"`
 }
 
-// Name is used as the name for this DNS solver when referencing it on the ACME
-// Issuer resource.
-// This should be unique **within the group name**, i.e. you can have two
-// solvers configured with the same Name() **so long as they do not co-exist
-// within a single webhook deployment**.
-// For example, `cloudflare` may be used as the name of a solver.
-func (c *customDNSProviderSolver) Name() string {
-	return "my-custom-solver"
+func (c *desecDNSProviderSolver) Name() string {
+	return "desec"
 }
 
-// Present is responsible for actually presenting the DNS record with the
-// DNS provider.
-// This method should tolerate being called multiple times with the same value.
-// cert-manager itself will later perform a self check to ensure that the
-// solver has correctly configured the DNS provider.
-func (c *customDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
+func (c *desecDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
+	klog.V(1).Infof("preset record '%s'", ch.ResolvedFQDN)
 	cfg, err := loadConfig(ch.Config)
+
+	klog.V(5).Info("retrieving secret")
+	apiToken, err := c.getSecretKey(cfg.APIKeySecretRef, ch.ResourceNamespace)
+	klog.V(5).Info("creating desec client")
+	api := c.getClient(apiToken)
+
+	klog.V(1).Infof("retrieving domain %s", util.UnFqdn(ch.ResolvedZone))
+
+	domain, subName, err := c.getRecordInfo(api, ch)
 	if err != nil {
 		return err
 	}
 
-	// TODO: do something more useful with the decoded configuration
-	fmt.Printf("Decoded configuration %v", cfg)
+	recordSet := new(desec.RRSet)
+	recordSet.Domain = domain.Name
+	recordSet.SubName = subName
+	recordSet.Records = append(recordSet.Records, "\""+ch.Key+"\"")
+	recordSet.Type = "TXT"
+	recordSet.TTL = 3600
 
-	// TODO: add code that sets a record in the DNS provider's console
+	klog.V(5).Info(recordSet)
+
+	record, err := api.Records.Create(context.Background(), *recordSet)
+	if err != nil {
+		klog.Fatal(err)
+		return err
+	}
+
+	klog.V(5).Infof("Record %s", record)
 	return nil
 }
 
-// CleanUp should delete the relevant TXT record from the DNS provider console.
-// If multiple TXT records exist with the same record name (e.g.
-// _acme-challenge.example.com) then **only** the record with the same `key`
-// value provided on the ChallengeRequest should be cleaned up.
-// This is in order to facilitate multiple DNS validations for the same domain
-// concurrently.
-func (c *customDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
-	// TODO: add code that deletes a record from the DNS provider's console
+func (c *desecDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
+	klog.V(1).Infof("cleanup record '%s'", ch.ResolvedFQDN)
+	cfg, err := loadConfig(ch.Config)
+
+	apiToken, err := c.getSecretKey(cfg.APIKeySecretRef, ch.ResourceNamespace)
+	api := c.getClient(apiToken)
+
+	domain, subName, err := c.getRecordInfo(api, ch)
+	if err != nil {
+		return err
+	}
+
+	recError := api.Records.Delete(context.Background(), domain.Name, subName, "TXT")
+	if recError != nil {
+		return recError
+	}
+	klog.V(1).Infof("Record %s in zone %s deleted", subName, domain.Name)
 	return nil
 }
 
-// Initialize will be called when the webhook first starts.
-// This method can be used to instantiate the webhook, i.e. initialising
-// connections or warming up caches.
-// Typically, the kubeClientConfig parameter is used to build a Kubernetes
-// client that can be used to fetch resources from the Kubernetes API, e.g.
-// Secret resources containing credentials used to authenticate with DNS
-// provider accounts.
-// The stopCh can be used to handle early termination of the webhook, in cases
-// where a SIGTERM or similar signal is sent to the webhook process.
-func (c *customDNSProviderSolver) Initialize(kubeClientConfig *rest.Config, stopCh <-chan struct{}) error {
-	///// UNCOMMENT THE BELOW CODE TO MAKE A KUBERNETES CLIENTSET AVAILABLE TO
-	///// YOUR CUSTOM DNS PROVIDER
+func (c *desecDNSProviderSolver) Initialize(kubeClientConfig *rest.Config, stopCh <-chan struct{}) error {
+	cl, err := kubernetes.NewForConfig(kubeClientConfig)
+	if err != nil {
+		return err
+	}
 
-	//cl, err := kubernetes.NewForConfig(kubeClientConfig)
-	//if err != nil {
-	//	return err
-	//}
-	//
-	//c.client = cl
-
-	///// END OF CODE TO MAKE KUBERNETES CLIENTSET AVAILABLE
+	c.client = cl
 	return nil
 }
 
-// loadConfig is a small helper function that decodes JSON configuration into
-// the typed config struct.
-func loadConfig(cfgJSON *extapi.JSON) (customDNSProviderConfig, error) {
-	cfg := customDNSProviderConfig{}
+func loadConfig(cfgJSON *extapi.JSON) (desecDNSProviderConfig, error) {
+	cfg := desecDNSProviderConfig{}
 	// handle the 'base case' where no configuration has been provided
 	if cfgJSON == nil {
 		return cfg, nil
@@ -143,4 +119,56 @@ func loadConfig(cfgJSON *extapi.JSON) (customDNSProviderConfig, error) {
 	}
 
 	return cfg, nil
+}
+
+func (c *desecDNSProviderSolver) getDomain(client desec.Client, subname string) (*desec.Domain, error) {
+	domains, err := client.Domains.GetAll(context.Background())
+	if err != nil {
+		panic(err)
+	}
+
+	for _, v := range domains {
+		if strings.HasSuffix(subname, v.Name) {
+			return &v, nil
+		}
+	}
+	return nil, fmt.Errorf("domain not found")
+}
+
+func (c *desecDNSProviderSolver) getRecordInfo(api desec.Client, ch *v1alpha1.ChallengeRequest) (*desec.Domain, string, error) {
+	klog.V(5).Infof("%s record", ch.ResolvedFQDN)
+	// Remove trailing dots from zone and fqdn
+	zone := util.UnFqdn(ch.ResolvedZone)
+	fqdn := util.UnFqdn(ch.ResolvedFQDN)
+
+	domain, err := c.getDomain(api, zone)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Get the subdomain portion of fqdn
+	subName := fqdn[:len(fqdn)-len(domain.Name)-1]
+
+	return domain, subName, nil
+}
+
+func (c *desecDNSProviderSolver) getClient(apiToken string) desec.Client {
+	return *desec.New(apiToken, desec.NewDefaultClientOptions())
+}
+
+// getSecretKey fetch a secret key based on a selector and a namespace
+func (c *desecDNSProviderSolver) getSecretKey(secret v1.SecretKeySelector, namespace string) (string, error) {
+	klog.V(5).Infof("retrieving key `%s` in secret `%s/%s`", secret.Key, namespace, secret.Name)
+
+	sec, err := c.client.CoreV1().Secrets(namespace).Get(context.Background(), secret.Name, metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("secret `%s/%s` not found", namespace, secret.Name)
+	}
+
+	data, ok := sec.Data[secret.Key]
+	if !ok {
+		return "", fmt.Errorf("key `%q` not found in secret `%s/%s`", secret.Key, namespace, secret.Name)
+	}
+
+	return string(data), nil
 }

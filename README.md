@@ -2,39 +2,120 @@
   <img src="https://raw.githubusercontent.com/cert-manager/cert-manager/d53c0b9270f8cd90d908460d69502694e1838f5f/logo/logo-small.png" height="256" width="256" alt="cert-manager project logo" />
 </p>
 
-# ACME webhook example
+# ACME webhook for desec.io DNS API
 
-The ACME issuer type supports an optional 'webhook' solver, which can be used
-to implement custom DNS01 challenge solving logic.
+This solver can be used with [desec.io](https://desec.io) DNS API. The documentation
+of the API can be found [here](https://desec.readthedocs.io/en/latest/)
 
-This is useful if you need to use cert-manager with a DNS provider that is not
-officially supported in cert-manager core.
+## Requirements
+- [go](https://golang.org) => 1.19.0
+- [helm](https://helm.sh/) >= v3.0.0
+- [kuberentes](https://kubernetes.io/) => 1.25.0
+- [cert-manager](https://cert-managaer.io/) => 1.11.0
 
-## Why not in core?
+## Installation
 
-As the project & adoption has grown, there has been an influx of DNS provider
-pull requests to our core codebase. As this number has grown, the test matrix
-has become un-maintainable and so, it's not possible for us to certify that
-providers work to a sufficient level.
+### Using helm from local checkout
+```bash
+helm install desec-webhook -n cert-manager deploy
+```
+### Using public helm chart
 
-By creating this 'interface' between cert-manager and DNS providers, we allow
-users to quickly iterate and test out new integrations, and then packaging
-those up themselves as 'extensions' to cert-manager.
 
-We can also then provide a standardised 'testing framework', or set of
-conformance tests, which allow us to validate the a DNS provider works as
-expected.
+## Uninstallation
 
-## Creating your own webhook
+## Creating an issuer
 
-Webhook's themselves are deployed as Kubernetes API services, in order to allow
-administrators to restrict access to webhooks with Kubernetes RBAC.
+Create a secret containing the credentials
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: desec-io-secret
+  namespace: cert-manager
+type: Opaque
+data:
+  token: your-key-base64-encoded
+```
 
-This is important, as otherwise it'd be possible for anyone with access to your
-webhook to complete ACME challenge validations and obtain certificates.
+Create a 'ClusterIssuer' or 'Issuer' resource as the following:
 
-To make the set up of these webhook's easier, we provide a template repository
-that can be used to get started quickly.
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email: mail@example.com
+
+    privateKeySecretRef:
+      name: letsencrypt-staging
+
+    solvers:
+      - dns01:
+          webhook:
+            config:
+              apiKeySecretRef:
+                key: token
+                name: desec-io-secret
+            groupName: acme.example.com
+            solverName: desec
+```
+
+## Create a manual certificate
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: example-cert
+  namespace: cert-manager
+spec:
+  commonName: example.com
+  dnsNames:
+    - example.com
+  issuerRef:
+    name: letsencrypt-staging
+    kind: ClusterIssuer
+  secretName: example-cert
+```
+
+## Using cert-manager with traefik ingress
+```yaml
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: bitwarden
+  namespace: utils
+  labels:
+    app: bitwarden
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-staging
+    kubernetes.io/ingress.class: traefik
+    traefik.ingress.kubernetes.io/rewrite-target: /$1
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: 'true'
+spec:
+  tls:
+    - hosts:
+        - bitwarden.acme.example.com
+      secretName: bitwarden-crt
+  rules:
+    - host: bitwarden.acme.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: bitwarden
+                port:
+                  number: 80
+
+```
 
 ### Creating your own repository
 
@@ -43,16 +124,19 @@ that can be used to get started quickly.
 All DNS providers **must** run the DNS01 provider conformance testing suite,
 else they will have undetermined behaviour when used with cert-manager.
 
-**It is essential that you configure and run the test suite when creating a
-DNS01 webhook.**
+Provide a secret.yaml in testdata/desec
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: desec-token
+data:
+  token: your-key-base64-encoded
+type: Opaque
+```
 
-An example Go test file has been provided in [main_test.go](https://github.com/cert-manager/webhook-example/blob/master/main_test.go).
-
-You can run the test suite with:
+Define a **TEST_ZONE_NAME** matching to your authenticaton creditials.
 
 ```bash
 $ TEST_ZONE_NAME=example.com. make test
 ```
-
-The example file has a number of areas you must fill in and replace with your
-own options in order for tests to pass.
